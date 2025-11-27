@@ -1,21 +1,27 @@
-const {onCall, HttpsError} = require("firebase-functions/v2/https");
 const {initializeApp} = require("firebase-admin/app");
-const {getFirestore, FieldValue} = require("firebase-admin/firestore");
-const fetch = require("node-fetch");
+const {getFirestore} = require("firebase-admin/firestore");
 const admin = require("firebase-admin");
-const AbortController = require("abort-controller");
 const logger = require("firebase-functions/logger");
-const cors = require("cors")({origin: true}); // Import and configure cors
+const cors = require("cors")({
+  origin: [
+    "https://a1dos-creations.com",
+    "http://localhost:5173",
+  ],
+  methods: ["POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+});
 const functions = require("firebase-functions");
 
 initializeApp();
 const db = getFirestore();
 
-const requiredSecrets = ["AI_KEY", "AI_ENDPOINT"];
-
 exports.createCustomAuthToken = functions.https.onRequest((req, res) => {
-  // Wrap the function with the cors handler
+  // Handle CORS + Preflight
   cors(req, res, async () => {
+    if (req.method === "OPTIONS") {
+      return res.status(204).send("");
+    }
+
     if (req.method !== "POST") {
       return res.status(405).send("Method Not Allowed");
     }
@@ -34,15 +40,16 @@ exports.createCustomAuthToken = functions.https.onRequest((req, res) => {
     try {
       let userRecord;
       if (isRegistering) {
-        // --- Registration Flow ---
         if (!name) {
           return res.status(400).json({error: {message: "Name is required."}});
         }
+
         userRecord = await admin.auth().createUser({
           email,
           password,
           displayName: name,
         });
+
         await db.collection("users").doc(userRecord.uid).set({
           email: userRecord.email,
           displayName: name,
@@ -50,6 +57,7 @@ exports.createCustomAuthToken = functions.https.onRequest((req, res) => {
           is_premium: false,
           messageCount: 0,
         });
+
         logger.info(`New user registered: ${userRecord.uid}`);
       } else {
         // --- Login Flow ---
@@ -62,155 +70,11 @@ exports.createCustomAuthToken = functions.https.onRequest((req, res) => {
       logger.error("Auth Token Error:", error.code, error.message);
       const publicError = {
         code: error.code || "unknown",
-        message: error.code === "auth/email-already-exists" ?
-                    "This email address is already in use." :
-                    "Invalid credentials or user does not exist.",
+        message:
+          error.code === "auth/email-already-exists" ? "This email address is already in use." : "Invalid credentials or user does not exist.",
       };
+
       return res.status(401).json({error: publicError});
     }
   });
-});
-
-exports.chatWithAI = onCall({secrets: requiredSecrets, timeoutSeconds: 60}, async (request) => {
-  if (!request.auth) {
-    throw new HttpsError("unauthenticated", "You must be logged in.");
-  }
-
-  const uid = request.auth.uid;
-  const {conversationId, newMessageText, imageUrl} = request.data;
-  const AI_API_KEY = process.env.AI_KEY;
-  const AI_API_ENDPOINT = process.env.AI_ENDPOINT;
-
-  const SYSTEM_INSTRUCTION = "You are an expert academic tutor AI named Gemini. You were created by Devin S. as a part of his Google Chrome extension 'School Tools'. Your sole purpose is to help students learn by guiding them to solve problems themselves. Your tone must always be encouraging and supportive. Core Rules: 1. NEVER provide direct answers or solutions to homework or what seems like schoolwork (answers to random questions not related to school curricula is ok). 2. DO NOT give hints. 3. Instead of hints, ask probing, Socratic-style questions that force the student to think critically about the problem. 4. Guide the student step-by-step, focusing on one part of the problem at a time. 5. If a student is stuck, ask them to explain what they've tried so far and where they are getting confused.";
-
-
-  if (!conversationId) {
-    throw new HttpsError("invalid-argument", "Missing conversationId.");
-  }
-  if (!AI_API_KEY || !AI_API_ENDPOINT) {
-    logger.error("AI secrets are not configured in the environment.");
-    throw new HttpsError("internal", "AI service is not configured correctly.");
-  }
-
-  const userRef = db.collection("users").doc(uid);
-  const conversationRef = userRef.collection("conversations").doc(conversationId);
-
-  try {
-    const userDoc = await userRef.get();
-    const isPremium = userDoc.data()?.is_premium === true;
-    const messageCount = userDoc.data()?.messageCount || 0;
-
-    if (!isPremium && messageCount >= 5) {
-      throw new HttpsError("permission-denied", "Daily message limit reached. Go Premium for unlimited messages!");
-    }
-
-    // --- START: NEW INLINE IMAGE LOGIC ---
-    // Prepare the current user's message for the AI using inlineData
-    const currentUserParts = [];
-    if (imageUrl) {
-      const imageResponse = await fetch(imageUrl);
-      const imageBuffer = await imageResponse.buffer();
-      const base64Data = imageBuffer.toString("base64");
-      currentUserParts.push({
-        inlineData: {
-          mimeType: "image/jpeg",
-          data: base64Data,
-        },
-      });
-    }
-    if (newMessageText) {
-      currentUserParts.push({text: newMessageText});
-    }
-    if (currentUserParts.length === 0) {
-      throw new HttpsError("invalid-argument", "Message cannot be empty.");
-    }
-    const newUserTurnForAI = {role: "user", parts: currentUserParts};
-    // --- END: NEW INLINE IMAGE LOGIC ---
-
-    // Prepare the user's message to be saved in our database (this doesn't change)
-    const userTurnForDb = {
-      role: "user",
-      parts: [{text: newMessageText || ""}, {imageUrl: imageUrl || null}],
-    };
-
-    const conversationDoc = await conversationRef.get();
-    const historyFromDb = conversationDoc.data()?.history || [];
-
-    // --- START: NEW HISTORY FORMATTING LOGIC ---
-    // Re-format the history to use inlineData for any past images
-    const historyForAI = await Promise.all(historyFromDb.map(async (turn) => {
-      if (turn.role === "user") {
-        const validPartsForAI = [];
-        const imagePartUrl = turn.parts.find((p) => p.imageUrl)?.imageUrl;
-        const textPart = turn.parts.find((p) => p.text)?.text;
-
-        if (imagePartUrl) {
-          const imageResponse = await fetch(imagePartUrl);
-          const imageBuffer = await imageResponse.buffer();
-          const base64Data = imageBuffer.toString("base64");
-          validPartsForAI.push({inlineData: {mimeType: "image/jpeg", data: base64Data}});
-        }
-        if (textPart) {
-          validPartsForAI.push({text: textPart});
-        }
-        return {role: "user", parts: validPartsForAI};
-      }
-      return turn;
-    }));
-
-    const fullPrompt = [...historyForAI, newUserTurnForAI];
-    const fullUrl = `${AI_API_ENDPOINT}?key=${AI_API_KEY}`;
-
-    const requestBody = {
-      contents: fullPrompt,
-      systemInstruction: {
-        parts: [{text: SYSTEM_INSTRUCTION}],
-      },
-    };
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 55000);
-
-    const response = await fetch(fullUrl, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      // Use the new requestBody object here
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      logger.error("AI API request failed:", {status: response.status, body: errorBody});
-      throw new HttpsError("internal", "The AI service failed to respond.");
-    }
-
-    const responseData = await response.json();
-    const aiMessage = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!aiMessage) {
-      logger.error("Failed to parse AI response:", responseData);
-      throw new HttpsError("internal", "Could not understand the AI response.");
-    }
-
-    const newModelTurn = {role: "model", parts: [{text: aiMessage}]};
-
-    await conversationRef.update({
-      history: FieldValue.arrayUnion(userTurnForDb, newModelTurn),
-      updatedAt: new Date(),
-    });
-
-    if (!isPremium) {
-      await userRef.update({messageCount: FieldValue.increment(1)});
-    }
-
-    return {reply: aiMessage};
-  } catch (error) {
-    logger.error("Error in chatWithAI:", error);
-    if (error.name === "AbortError") {
-      throw new HttpsError("deadline-exceeded", "The AI took too long to respond. Please try again.");
-    }
-    if (error instanceof HttpsError) throw error;
-    throw new HttpsError("internal", "An unexpected error occurred.");
-  }
 });
